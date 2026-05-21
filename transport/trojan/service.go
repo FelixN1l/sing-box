@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
@@ -21,6 +22,11 @@ type Handler interface {
 }
 
 type Service[K comparable] struct {
+	// mu guards users/keys. Added by the milou fork: upstream built them
+	// once at construction, but milou calls UpdateUsers at runtime for
+	// hot reload, racing the NewConnection reader. UpdateUsers takes the
+	// write lock; NewConnection snapshots under the read lock.
+	mu              sync.RWMutex
 	users           map[K][56]byte
 	keys            map[[56]byte]K
 	handler         Handler
@@ -54,12 +60,20 @@ func (s *Service[K]) UpdateUsers(userList []K, passwordList []string) error {
 		users[user] = key
 		keys[key] = user
 	}
+	s.mu.Lock()
 	s.users = users
 	s.keys = keys
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	// milou fork: snapshot the key map under the read lock — UpdateUsers
+	// swaps it at runtime for hot reload (see the struct comment).
+	s.mu.RLock()
+	keys := s.keys
+	s.mu.RUnlock()
+
 	var key [KeyLength]byte
 	n, err := conn.Read(key[:])
 	if err != nil {
@@ -68,7 +82,7 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		return s.fallback(ctx, conn, source, key[:n], E.New("bad request size"), onClose)
 	}
 
-	if user, loaded := s.keys[key]; loaded {
+	if user, loaded := keys[key]; loaded {
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		return s.fallback(ctx, conn, source, key[:], E.New("bad request"), onClose)

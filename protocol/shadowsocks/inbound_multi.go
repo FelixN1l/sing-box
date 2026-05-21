@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -40,8 +41,12 @@ type MultiInbound struct {
 	logger   logger.ContextLogger
 	listener *listener.Listener
 	service  shadowsocks.MultiService[int]
-	users    []option.ShadowsocksUser
-	tracker  adapter.SSMTracker
+	// usersAccess guards users. Added by the milou fork: UpdateUsers is
+	// already public (for SSM), but it swapped users without guarding
+	// the newConnection / newPacketConnection index lookup against it.
+	usersAccess sync.RWMutex
+	users       []option.ShadowsocksUser
+	tracker     adapter.SSMTracker
 }
 
 func newMultiInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (*MultiInbound, error) {
@@ -129,11 +134,14 @@ func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {
 	if err != nil {
 		return err
 	}
-	h.users = common.Map(users, func(user string) option.ShadowsocksUser {
+	updated := common.Map(users, func(user string) option.ShadowsocksUser {
 		return option.ShadowsocksUser{
 			Name: user,
 		}
 	})
+	h.usersAccess.Lock()
+	h.users = updated
+	h.usersAccess.Unlock()
 	return nil
 }
 
@@ -163,7 +171,13 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	h.usersAccess.RLock()
+	users := h.users
+	h.usersAccess.RUnlock()
+	var user string
+	if userIndex >= 0 && userIndex < len(users) {
+		user = users[userIndex].Name
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -186,7 +200,13 @@ func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketCon
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	h.usersAccess.RLock()
+	users := h.users
+	h.usersAccess.RUnlock()
+	var user string
+	if userIndex >= 0 && userIndex < len(users) {
+		user = users[userIndex].Name
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {

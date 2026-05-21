@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -31,15 +32,37 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	router                   adapter.ConnectionRouterEx
-	logger                   log.ContextLogger
-	listener                 *listener.Listener
-	service                  *trojan.Service[int]
+	router   adapter.ConnectionRouterEx
+	logger   log.ContextLogger
+	listener *listener.Listener
+	service  *trojan.Service[int]
+	// usersAccess guards users. Added by the milou fork so UpdateUsers
+	// can swap the roster at runtime (hot reload) without racing the
+	// newConnection / newPacketConnection index lookup.
+	usersAccess              sync.RWMutex
 	users                    []option.TrojanUser
 	tlsConfig                tls.ServerConfig
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
 	transport                adapter.V2RayServerTransport
+}
+
+// UpdateUsers replaces the inbound's user set at runtime — a milou fork
+// addition for hot user reload. It swaps both the service's auth tables
+// and the users slice that newConnection maps an authenticated index
+// back through, so neither is left racing a live connection.
+func (h *Inbound) UpdateUsers(users []option.TrojanUser) error {
+	err := h.service.UpdateUsers(
+		common.MapIndexed(users, func(index int, it option.TrojanUser) int { return index }),
+		common.Map(users, func(it option.TrojanUser) string { return it.Password }),
+	)
+	if err != nil {
+		return err
+	}
+	h.usersAccess.Lock()
+	h.users = users
+	h.usersAccess.Unlock()
+	return nil
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanInboundOptions) (adapter.Inbound, error) {
@@ -189,7 +212,13 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	h.usersAccess.RLock()
+	users := h.users
+	h.usersAccess.RUnlock()
+	var user string
+	if userIndex >= 0 && userIndex < len(users) {
+		user = users[userIndex].Name
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -207,7 +236,13 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	h.usersAccess.RLock()
+	users := h.users
+	h.usersAccess.RUnlock()
+	var user string
+	if userIndex >= 0 && userIndex < len(users) {
+		user = users[userIndex].Name
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
