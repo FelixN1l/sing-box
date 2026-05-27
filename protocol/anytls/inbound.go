@@ -79,6 +79,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
+// UpdateUsers replaces the inbound's user set at runtime — a milou fork
+// addition for hot user reload. It forwards to the underlying anytls
+// service, whose forked UpdateUsers swaps the sha-keyed auth map under
+// its own write lock (see github.com/anytls/sing-anytls's service.go).
+// Returns an error for symmetry with the other protocols' UpdateUsers;
+// the anytls service's UpdateUsers can't itself fail.
+func (h *Inbound) UpdateUsers(users []option.AnyTLSUser) error {
+	h.service.UpdateUsers(common.Map(users, func(it option.AnyTLSUser) anytls.User {
+		return (anytls.User)(it)
+	}))
+	return nil
+}
+
 func (h *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
