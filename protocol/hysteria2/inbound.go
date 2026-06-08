@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -30,12 +31,38 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router       adapter.Router
-	logger       log.ContextLogger
-	listener     *listener.Listener
-	tlsConfig    tls.ServerConfig
-	service      *hysteria2.Service[int]
+	router    adapter.Router
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	tlsConfig tls.ServerConfig
+	service   *hysteria2.Service[int]
+	// usersAccess guards userNameList. Added by the milou fork so
+	// UpdateUsers can swap the roster at runtime (hot reload) without
+	// racing the NewConnectionEx / NewPacketConnectionEx index lookup.
+	usersAccess  sync.RWMutex
 	userNameList []string
+}
+
+// UpdateUsers replaces the inbound's user set at runtime — a milou fork
+// addition for hot user reload. It forwards to the underlying sing-quic
+// hysteria2 service (whose forked UpdateUsers swaps the auth map under
+// its own write lock), then swaps the inbound's userNameList — the slice
+// that NewConnectionEx maps an authenticated userID back through. Both
+// halves are now lock-safe.
+func (h *Inbound) UpdateUsers(users []option.Hysteria2User) error {
+	userList := make([]int, len(users))
+	userNameList := make([]string, len(users))
+	userPasswordList := make([]string, len(users))
+	for i, u := range users {
+		userList[i] = i
+		userNameList[i] = u.Name
+		userPasswordList[i] = u.Password
+	}
+	h.service.UpdateUsers(userList, userPasswordList)
+	h.usersAccess.Lock()
+	h.userNameList = userNameList
+	h.usersAccess.Unlock()
+	return nil
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -156,7 +183,17 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	// milou fork: snapshot the name list under the read lock — UpdateUsers
+	// swaps it at runtime for hot reload. Bounds-check guards against a
+	// stale userID after a roster shrink between auth and routing.
+	h.usersAccess.RLock()
+	userNameList := h.userNameList
+	h.usersAccess.RUnlock()
+	var userName string
+	if userID >= 0 && userID < len(userNameList) {
+		userName = userNameList[userID]
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
@@ -178,7 +215,14 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	h.usersAccess.RLock()
+	userNameList := h.userNameList
+	h.usersAccess.RUnlock()
+	var userName string
+	if userID >= 0 && userID < len(userNameList) {
+		userName = userNameList[userID]
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {
